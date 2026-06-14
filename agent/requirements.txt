@@ -1,0 +1,12 @@
+beautifulsoup4==4.15.0
+python-dotenv==1.2.2
+requests==2.34.2
+soupsieve==2.8.4
+prompt_toolkit==3.0.52
+
+certifi==2026.5.20
+charset-normalizer==3.4.7
+idna==3.18
+typing_extensions==4.15.0
+urllib3==2.7.0
+wcwidth==0.8.1
