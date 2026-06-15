@@ -115,10 +115,26 @@ async def chat_with_agent(user_message_content):
         if not response.is_success:
             print(f"{response.status_code=}")
             print(f"{response.text=}")
+            print()
+
             match response.status_code:
                 case 400:
-                    print("☁️  ⚠️  | Server error, retrying in 10 seconds...")
-                    await asyncio.sleep(10)
+                    print(
+                        "⚠️  🔄 | Bad Request, feeding error details to agent for correction..."
+                    )
+                    print()
+
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "The server rejected the previous request with a 400 Bad Request error. "
+                                "Review the raw server response below to identify what went wrong, "
+                                "correct the issue, and try again:\n\n"
+                                f"```json\n{response.text}\n```"
+                            ),
+                        }
+                    )
                     continue
                 case 429:
 
