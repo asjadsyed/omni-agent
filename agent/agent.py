@@ -112,11 +112,8 @@ async def chat_with_agent(user_message_content):
             response = await client.post(
                 API_URL, headers=HEADERS, json=payload, timeout=None
             )
-        if not response.is_success:
-            print(f"{response.status_code=}")
-            print(f"{response.text=}")
-            print()
 
+        if not response.is_success:
             match response.status_code:
                 case 400:
                     print(
@@ -137,7 +134,6 @@ async def chat_with_agent(user_message_content):
                     )
                     continue
                 case 429:
-
                     data = response.json()
                     error_message = data["error"]["message"]
                     match = RATE_LIMIT_RETRY_RE.search(error_message)
@@ -173,8 +169,12 @@ async def chat_with_agent(user_message_content):
                     )
                     # TODO
                     continue
+                case _:
+                    print(f"{response.status_code=}")
+                    print(f"{response.text=}")
+                    print()
+                    response.raise_for_status()
 
-            response.raise_for_status()
         response_data = response.json()
 
         # Extract the assistant message dictionary
