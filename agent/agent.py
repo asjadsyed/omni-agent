@@ -2,11 +2,11 @@
 import asyncio
 import json
 import re
-import requests
 import subprocess
 import sys
 
 import dotenv
+import httpx
 
 GROQ_API_KEY = dotenv.get_key(dotenv.find_dotenv(), "GROQ_API_KEY")
 
@@ -104,8 +104,11 @@ async def chat_with_agent(user_message_content):
         }
 
         # print("Sending messages for inference...")
-        response = requests.post(API_URL, headers=HEADERS, json=payload)
-        if not response.ok:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                API_URL, headers=HEADERS, json=payload, timeout=None
+            )
+        if not response.is_success:
             print(f"{response.status_code=}")
             print(f"{response.text=}")
             match response.status_code:
