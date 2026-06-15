@@ -2,7 +2,6 @@
 import asyncio
 import json
 import re
-import subprocess
 import sys
 
 import dotenv
@@ -28,12 +27,17 @@ RATE_LIMIT_RETRY_RE = re.compile(
 
 
 # Local Python Functions (The real tools on your system)
-def bash_tool(command: str):
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+async def bash_tool(command: str):
+    result = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await result.communicate()
     return {
         "success": result.returncode == 0,
-        "stdout": result.stdout.strip(),
-        "stderr": result.stderr.strip(),
+        "stdout": stdout.decode().strip(),
+        "stderr": stderr.decode().strip(),
         "returncode": result.returncode,
     }
 
@@ -185,7 +189,9 @@ async def chat_with_agent(user_message_content):
 
                 match function_name:
                     case "bash_tool":
-                        tool_result = bash_tool(command=function_args.get("command"))
+                        tool_result = await bash_tool(
+                            command=function_args.get("command")
+                        )
 
                         # Append the execution result to history using the tool role and call ID
                         tool_message = {
