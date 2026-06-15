@@ -208,16 +208,25 @@ async def chat_with_agent(user_message_content):
                         tool_result = await bash_tool(
                             command=function_args.get("command")
                         )
-
-                        # Append the execution result to history using the tool role and call ID
-                        tool_message = {
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": function_name,
-                            "content": json.dumps(tool_result),
+                    case _:
+                        tool_result = {
+                            "success": False,
+                            "error": (
+                                f"The function name '{function_name}' is not recognized. "
+                                "Please review your tool definitions and retry using only the "
+                                "exact tool names provided in your configuration."
+                            ),
                         }
-                        yield tool_message
-                        messages.append(tool_message)
+
+                # Append the execution result to history using the tool role and call ID
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "name": function_name,
+                    "content": json.dumps(tool_result),
+                }
+                yield tool_message
+                messages.append(tool_message)
 
 
 async def main(argv):
