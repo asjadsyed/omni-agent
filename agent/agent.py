@@ -20,7 +20,7 @@ HEADERS = {
 RATE_LIMIT_RETRY_RE = re.compile(
     r"Please try again in\s+"
     r"(?:(?P<hours>\d+(?:\.\d+)?)h)?"
-    r"(?:(?P<minutes>\d+(?:\.\d+)?)m)?"
+    r"(?:(?P<minutes>\d+(?:\.\d+)?)m(?!s))?"
     r"(?:(?P<seconds>\d+(?:\.\d+)?)s)?"
     r"(?:(?P<milliseconds>\d+(?:\.\d+)?)ms)?"
 )
