@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
 import json
-import re
 import sys
 
 import dotenv
@@ -16,14 +15,6 @@ HEADERS = {
     "Content-Type": "application/json",
     # "Authorization": f"Bearer {GROQ_API_KEY}",
 }
-
-RATE_LIMIT_RETRY_RE = re.compile(
-    r"Please try again in\s+"
-    r"(?:(?P<hours>\d+(?:\.\d+)?)h)?"
-    r"(?:(?P<minutes>\d+(?:\.\d+)?)m(?!s))?"
-    r"(?:(?P<seconds>\d+(?:\.\d+)?)s)?"
-    r"(?:(?P<milliseconds>\d+(?:\.\d+)?)ms)?"
-)
 
 
 # Local Python Functions (The real tools on your system)
@@ -134,32 +125,12 @@ async def chat_with_agent(user_message_content):
                     )
                     continue
                 case 429:
-                    data = response.json()
-                    error_message = data["error"]["message"]
-                    match = RATE_LIMIT_RETRY_RE.search(error_message)
-
-                    if match:
-                        hours = float(match.group("hours") or 0)
-                        minutes = float(match.group("minutes") or 0)
-                        seconds = float(match.group("seconds") or 0)
-                        milliseconds = float(match.group("milliseconds") or 0)
-
-                        rate_limit_duration = (
-                            hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
-                        )
-
-                        print(
-                            f"Extracted rate limit duration: {rate_limit_duration} seconds"
-                        )
-                    else:
+                    retry_after = response.headers.get("Retry-After")
+                    try:
+                        rate_limit_duration = float(retry_after)
+                    except ValueError:
                         rate_limit_duration = 10
-                        print(
-                            "Could not parse rate limit duration; defaulting to 10 seconds"
-                        )
-
-                    print(
-                        f"⏳ | Sleeping for {rate_limit_duration} seconds before retrying..."
-                    )
+                    print(f"⏳ 🛑 | Rate limited, retrying after {rate_limit_duration:.1f} seconds...")
                     print()
                     await asyncio.sleep(rate_limit_duration)
                     continue
