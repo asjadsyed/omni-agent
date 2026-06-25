@@ -74,3 +74,7 @@ services:
       - ./agent:/app:ro
       - ./workspace:/workspace
       - ./output:/output
+      - hf_cache:/root/.cache/huggingface
+
+volumes:
+  hf_cache:

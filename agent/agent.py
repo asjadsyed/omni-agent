@@ -1,45 +1,111 @@
 #!/usr/bin/env python3
 import asyncio
+from collections.abc import AsyncGenerator
+import copy
+import enum
 import json
 import sys
 
 import dotenv
 import httpx
+from prompt_toolkit import PromptSession
+from transformers import AutoTokenizer
 
-GROQ_API_KEY = dotenv.get_key(dotenv.find_dotenv(), "GROQ_API_KEY")
+LLAMA_CPP_API_URL: str = "http://llama-cpp:8080/v1/chat/completions"
+LLAMA_CPP_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "LLAMA_CPP_API_KEY")
+GROQ_API_URL: str = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "GROQ_API_KEY")
+HF_API_URL: str = "https://router.huggingface.co/v1/chat/completions"
+HF_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "HF_TOKEN")
+OPENROUTER_API_URL: str = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "OPENROUTER_API_KEY")
+NVIDIA_API_URL: str = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "NVIDIA_API_KEY")
 
-# Configuration
-API_URL = "http://llama-cpp:8080/v1/chat/completions"
-# API_URL = "https://api.groq.com/openai/v1/chat/completions"
-HEADERS = {
+MODEL_ID = "openai/gpt-oss-20b"
+TOKENIZER = AutoTokenizer.from_pretrained(MODEL_ID)
+ARTIFACT_DIR = "/artifacts"
+
+MAX_CONTEXT_TOKENS: int = 131_072
+# Aim well below the hard cap so the model has room to produce a long response
+# AND so the next tool result doesn't immediately trigger another trim.
+TRIM_TARGET_TOKENS: int = int(MAX_CONTEXT_TOKENS * 0.75)
+
+api_url: str = ""
+api_key: str = ""
+headers = {
     "Content-Type": "application/json",
-    # "Authorization": f"Bearer {GROQ_API_KEY}",
+    "Authorization": f"Bearer {api_key}",
 }
+
+
+class Provider(enum.Enum):
+    LLAMA_CPP = "llama-cpp"
+    GROQ = "groq"
+    HF = "hf"
+    OPENROUTER = "openrouter"
+    NVIDIA = "nvidia"
+
+
+def set_provider(new_provider: Provider):
+    global api_url, api_key, headers, provider
+    provider = new_provider
+    match provider:
+        case Provider.LLAMA_CPP:
+            api_url = LLAMA_CPP_API_URL
+            api_key = LLAMA_CPP_API_KEY
+        case Provider.GROQ:
+            api_url = GROQ_API_URL
+            api_key = GROQ_API_KEY
+        case Provider.HF:
+            api_url = HF_API_URL
+            api_key = HF_API_KEY
+        case Provider.OPENROUTER:
+            api_url = OPENROUTER_API_URL
+            api_key = OPENROUTER_API_KEY
+        case Provider.NVIDIA:
+            api_url = NVIDIA_API_URL
+            api_key = NVIDIA_API_KEY
+    headers["Authorization"] = f"Bearer {api_key}"
+
+
+provider = Provider.LLAMA_CPP
+set_provider(provider)
 
 
 # Local Python Functions (The real tools on your system)
 async def bash_tool(command: str):
     result = await asyncio.create_subprocess_shell(
         command,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
     )
     stdout, stderr = await result.communicate()
     return {
-        "success": result.returncode == 0,
-        "stdout": stdout.decode().strip(),
-        "stderr": stderr.decode().strip(),
-        "returncode": result.returncode,
+        "data": stdout.decode().strip(),
+        "metadata": {
+            "success": result.returncode == 0,
+            "returncode": result.returncode,
+        },
     }
 
 
 # Define the Tool Schemas (What the AI reads)
-tools = [
+TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
             "name": "bash_tool",
-            "description": "Execute a shell command on the host system to run code, access system utilities, or manage environment resources. Call this tool when fulfilling the request requires external execution or live system interaction.",
+            "description": (
+                "Execute a shell command in the container to run code, access system utilities, or manage environment resources. "
+                "Call this tool when fulfilling the request requires external execution or live system interaction. \n"
+                "\n"
+                "Rather than returning the raw output directly, the tool replies with a JSON summary that tells you where the full output was saved, whether the command exited cleanly, its exit code, its MIME type, line and byte counts, and a truncated preview of the output (indicated by <TRUNCATED>). "
+                "The preview is only meant for quick inspection. "
+                "When you need to see more than the preview, use a selective command that extracts only what you need from the saved artifact path - for example with grep, sed, awk, jq, head, or tail. "
+                "Note that every command only returns a truncated preview, so non-selective commands like cat will simply produce another low-signal summary. You must use a filtering tool to actually see the content and will never receive the raw file contents."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -51,10 +117,11 @@ tools = [
         },
     }
 ]
+TOOL_NAMES: set[str] = {tool["function"]["name"] for tool in TOOL_SCHEMAS}
 
 
 # Send the initial user message + the tools list to the model
-messages = [
+SYSTEM_MESSAGES = [
     {
         "role": "system",
         "content": """\
@@ -68,6 +135,10 @@ Do not assume what can be observed.
 
 When uncertain, gather information rather than speculate.
 
+Your memory is unreliable and outdated. Every fact you need must be verified through tool use before you act on it or ask the user. The user is only to be consulted when your tools cannot provide the answer.
+
+All facts must be taken directly from a tool's output; you may never answer, act, or make a decision based on any internal knowledge that has not been freshly obtained and confirmed by that tool.
+
 If later actions depend on earlier actions, observe the outcome before proceeding.
 
 Errors are observations, not conclusions.
@@ -77,41 +148,245 @@ Continue working toward the goal until:
 - you determine it cannot be completed, or
 - you require information that only the user can provide.
 
+Do not end early because of time, token, effort, or detail concerns; continue until the task is complete or a real stopping condition is met.
+
 Explain failures only after exhausting reasonable attempts to recover.
 
-Prefer actions over descriptions when actions are possible.
+The user's request grants permission to perform actions that are reasonably necessary to accomplish it.
+
+Prefer removing obstacles to reporting obstacles.
+
+Do not ask the user to perform actions that you can perform yourself.
+
+Only seek user input when information, resources, or decisions are required that only the user can provide.
 """,
-    }
+    },
+    {
+        "role": "system",
+        "content": (
+            "System implementation notes:\n"
+            "The system is running in a Debian Docker container as root. \n"
+        ),
+    },
 ]
+messages = copy.deepcopy(SYSTEM_MESSAGES)
 
 
-async def chat_with_agent(user_message_content):
+def count_tokens(messages):
+    """
+    Count the exact number of tokens that would be sent to the model
+    for the given conversation history using the model's tokenizer.
+    """
+    encoded = TOKENIZER.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+    )
+    token_count = len(encoded["input_ids"])
+    print(f"🧩 🧮 | Token count: {token_count}")
+    print()
+    return token_count
+
+
+async def trim_context() -> None:
+    """
+    Trim the global ``messages`` list to TRIM_TARGET_TOKENS when it exceeds
+    MAX_CONTEXT_TOKENS.
+
+    Strategy
+    --------
+    Phase 1 - Drop complete old exchanges, oldest first.
+        An "exchange" is one user message plus every assistant/tool turn that
+        follows, up to (but not including) the next user message. The final
+        exchange (the current in-progress request) is never dropped.
+
+    Phase 2 - Drop inner tool-call groups from the surviving exchange.
+        If the current exchange alone is still too large, iteratively remove
+        its oldest (assistant-with-tool_calls + tool-result) block. The user
+        message and any final plain-text assistant reply are left untouched.
+    """
     global messages
+
+    token_count = count_tokens(messages)
+    if token_count <= MAX_CONTEXT_TOKENS:
+        return
+
+    print(
+        f"🗜️  | {token_count}/{MAX_CONTEXT_TOKENS} tokens - trimming to <= {TRIM_TARGET_TOKENS}"
+    )
+
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    def exchange_slices(msgs: list[dict]) -> list[tuple[int, int]]:
+        """
+        Return [(start, end), ...] where each half-open slice covers one exchange.
+
+        System messages sit before the first user message and are naturally
+        excluded because we index by user-message positions.
+        """
+        user_pos = [i for i, m in enumerate(msgs) if m["role"] == "user"]
+        return [
+            (
+                start,
+                user_pos[k + 1] if k + 1 < len(user_pos) else len(msgs),
+            )
+            for k, start in enumerate(user_pos)
+        ]
+
+    def tool_call_groups(msgs: list[dict], lo: int, hi: int) -> list[tuple[int, int]]:
+        """
+        Within msgs[lo:hi] find each atomic (assistant-with-tool_calls +
+        following tool messages) block. Returns absolute indices into msgs.
+
+        An assistant message without tool_calls (plain text) is NOT a group;
+        neither is a bare user message. We never yield those, so callers
+        never accidentally drop them.
+        """
+        groups: list[tuple[int, int]] = []
+        i = lo
+        while i < hi:
+            if msgs[i]["role"] == "assistant" and msgs[i].get("tool_calls"):
+                j = i + 1
+                while j < hi and msgs[j]["role"] == "tool":
+                    j += 1
+                groups.append((i, j))
+                i = j
+            else:
+                i += 1
+        return groups
+
+    # ── Phase 1: drop complete old exchanges ───────────────────────────────────
+
+    exchanges = exchange_slices(messages)
+    while count_tokens(messages) > TRIM_TARGET_TOKENS and len(exchanges) > 1:
+        start, end = exchanges[0]
+        print(
+            f"🗜️  | dropping exchange [{start}:{end}] "
+            f"roles={[m['role'] for m in messages[start:end]]}"
+        )
+        del messages[start:end]
+        exchanges = exchange_slices(messages)  # recalculate; indices shifted
+
+    if count_tokens(messages) <= TRIM_TARGET_TOKENS:
+        print(f"🗜️  | done after Phase 1 - {count_tokens(messages)} tokens")
+        return
+
+    # ── Phase 2: current exchange is still too large ───────────────────────────
+
+    print("🗜️  | Phase 2 - dropping inner tool groups from current exchange...")
+    exchanges = exchange_slices(messages)
+    if not exchanges:
+        return
+
+    ex_start, ex_end = exchanges[0]  # only one exchange remains
+
+    while count_tokens(messages) > TRIM_TARGET_TOKENS:
+        groups = tool_call_groups(messages, ex_start, ex_end)
+
+        if not groups:
+            # All that's left is the user message (and maybe a plain assistant
+            # reply).  We cannot trim further without destroying the request.
+            print("🗜️  | no tool groups left - context cannot be reduced further")
+            break
+
+        g_start, g_end = groups[0]
+        print(
+            f"🗜️  | dropping tool group [{g_start}:{g_end}] "
+            f"roles={[m['role'] for m in messages[g_start:g_end]]}"
+        )
+        del messages[g_start:g_end]
+        ex_end -= g_end - g_start  # keep window consistent after in-place delete
+
+    print(f"🗜️  | done after Phase 2 - {count_tokens(messages)} tokens")
+
+
+async def save_artifacts(tool_call_id: str, tool_result: dict) -> str:
+    data_path = f"{ARTIFACT_DIR}/{tool_call_id}.log"
+    metadata_path = f"{ARTIFACT_DIR}/{tool_call_id}.metadata.json"
+
+    with open(data_path, "wb") as f:
+        f.write(
+            tool_result["data"].encode()
+            if isinstance(tool_result["data"], str)
+            else tool_result["data"]
+        )
+
+    async def run(command: str) -> str:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        return stdout.decode().strip()
+
+    data = tool_result["data"]
+    output_str = (
+        data.decode(errors="replace") if isinstance(data, bytes) else (data or "")
+    )
+    preview = (
+        output_str
+        if len(output_str) <= 200
+        else (output_str[:100] + "<TRUNCATED>" + output_str[-100:])
+    )
+    generic_metadata = {
+        "preview": preview,
+        "mime-type": await run(f"file --brief --mime-type '{data_path}'"),
+        "line-count": int(await run(f"wc -l < '{data_path}'")),
+        "byte-count": int(await run(f"wc -c < '{data_path}'")),
+    }
+    tool_message_content = {
+        "artifact_path": data_path,
+        "metadata": {**generic_metadata, **tool_result["metadata"]},
+    }
+
+    with open(metadata_path, "w") as f:
+        json.dump(tool_message_content["metadata"], f)
+    return json.dumps(tool_message_content)
+
+
+async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
+    global messages
+    global provider
     messages.append({"role": "user", "content": user_message_content})
 
     # Keep looping as long as the model wants to call tools
     while True:
+        await trim_context()
+
+        model = f"{MODEL_ID}:free" if provider == Provider.OPENROUTER else MODEL_ID
         payload = {
-            "model": "openai/gpt-oss-20b",
+            "model": model,
             "messages": messages,
-            "tools": tools,
+            "tools": TOOL_SCHEMAS,
             "tool_choice": "auto",
         }
 
         # print("Sending messages for inference...")
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                API_URL, headers=HEADERS, json=payload, timeout=None
+                api_url, headers=headers, json=payload, timeout=None
             )
 
-        if not response.is_success:
-            match response.status_code:
+        response_data = response.json()
+
+        status_code = response.status_code
+        is_success = 200 <= status_code < 300
+        if is_success:
+            error = response_data.get("error")
+            if error:
+                status_code = error.get("code")
+                is_success = 200 <= status_code < 300
+
+        if not is_success:
+            match status_code:
                 case 400:
                     print(
                         "⚠️  🔄 | Bad Request, feeding error details to agent for correction..."
                     )
                     print()
-
                     messages.append(
                         {
                             "role": "system",
@@ -126,11 +401,14 @@ async def chat_with_agent(user_message_content):
                     continue
                 case 429:
                     retry_after = response.headers.get("Retry-After")
+                    rate_limit_duration = 10
                     try:
                         rate_limit_duration = float(retry_after)
-                    except ValueError:
-                        rate_limit_duration = 10
-                    print(f"⏳ 🛑 | Rate limited, retrying after {rate_limit_duration:.1f} seconds...")
+                    except (TypeError, ValueError):
+                        pass
+                    print(
+                        f"🛑 ⏳ | Rate limited, retrying after {rate_limit_duration:.1f} seconds..."
+                    )
                     print()
                     await asyncio.sleep(rate_limit_duration)
                     continue
@@ -138,42 +416,148 @@ async def chat_with_agent(user_message_content):
                     print(
                         "Request entity too large, compacting message history and retrying..."
                     )
+                    print()
+                    await asyncio.sleep(10)
                     # TODO
                     continue
+                case 500 | 502 | 503 | 504:
+                    print(
+                        f"⚠️  🔄 | {response.reason_phrase}, retrying after 10 seconds..."
+                    )
+                    print()
+                    await asyncio.sleep(10)
+                    continue
                 case _:
-                    print(f"{response.status_code=}")
-                    print(f"{response.text=}")
+                    print(
+                        f"⚠️  | Unexpected HTTP error ({status_code}): {response.text}"
+                    )
                     print()
                     response.raise_for_status()
 
-        response_data = response.json()
-
         # Extract the assistant message dictionary
         assistant_message = response_data["choices"][0]["message"]
-        # print(f"{assistant_message=}")
+
+        # Normalize provider output to prevent Jinja chat template errors
+        if not assistant_message.get("content"):
+            assistant_message["content"] = ""
+        if not assistant_message.get("tool_calls"):
+            assistant_message.pop("tool_calls", None)
+        if not assistant_message.get("reasoning"):
+            assistant_message.pop("reasoning", None)
+        if not assistant_message.get("reasoning_content"):
+            assistant_message.pop("reasoning_content", None)
+
         tool_calls = assistant_message.get("tool_calls")
-        # print(f"{tool_calls=}")
 
         # We must append the model's exact response containing the tool request to history
         yield assistant_message
         messages.append(assistant_message)
 
+        finish_reason = response_data["choices"][0].get("finish_reason")
+        stop_reason = response_data["choices"][0].get("stop_reason")
+        # 2000212 == <|call|>
+        # https://developers.openai.com/cookbook/articles/openai-harmony#special-tokens
+        if finish_reason == "stop" and stop_reason == 200012:
+            print(
+                "🩹 🔄 | Agent triggered <|call|> but omitted tool payload. Injecting error message..."
+            )
+            print()
+            response_data["choices"][0]["finish_reason"] = "tool_calls"
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "You halted to make a tool call but did not provide the command payload. Please emit the tool call parameters for the action you just described.",
+                }
+            )
+            continue
         # Break condition: If there are no tool calls, this is your final response to the user
-        if tool_calls is None:
+        if not tool_calls:
             return
         else:
             # Handle the tool calls if the model requested them
-            # print("The assistant decided that tool calls were necessary.")
 
             for tool_call in tool_calls:
                 function_name = tool_call["function"]["name"]
-                function_args = json.loads(tool_call["function"]["arguments"])
+                if "<|" in function_name:
+                    print(
+                        "🩹 ✂️  | Stripping Harmony channel tokens from function name for compatibility with tool execution"
+                    )
+                    print()
+                    function_name = function_name.partition("<|")[0].strip()
+                if (
+                    function_name.endswith("commentary")
+                    and (stripped_function_name := function_name[: -len("commentary")])
+                    in TOOL_NAMES
+                ):
+                    print(
+                        "🩹 ✂️  | Stripping 'commentary' suffix from function name for compatibility with tool execution"
+                    )
+                    print()
+                    function_name = stripped_function_name
+                tool_call["function"]["name"] = function_name
+                if function_name not in TOOL_NAMES:
+                    print(
+                        f"⚠️  🔄 | Unrecognized tool call: '{function_name}', injecting error message..."
+                    )
+                    print()
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": function_name,
+                        "content": json.dumps(
+                            {
+                                "success": False,
+                                "error": "The model requested a tool that is not defined in the system. Please review the tool definitions and ensure the model only calls valid tools.",
+                                "received_function_name": function_name,
+                                "allowed_tools": list(TOOL_NAMES),
+                            }
+                        ),
+                    }
+
+                    yield tool_message
+                    messages.append(tool_message)
+                    continue
+                try:
+                    function_args = json.loads(tool_call["function"]["arguments"])
+                except json.decoder.JSONDecodeError as e:
+                    function_args = {}
+                    print(
+                        f"⚠️  🔄 | Failed to decode JSON arguments for tool call: {function_name}, feeding error details to agent for correction..."
+                    )
+                    print()
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": function_name,
+                        "content": json.dumps(
+                            {
+                                "success": False,
+                                "error": (
+                                    "Tool arguments were not valid JSON. "
+                                    f"{e.msg} at line {e.lineno}, column {e.colno}."
+                                ),
+                                "received_arguments": tool_call["function"][
+                                    "arguments"
+                                ],
+                            }
+                        ),
+                    }
+
+                    yield tool_message
+                    messages.append(tool_message)
+                    continue
 
                 print(
                     f"🕵️  🛠️  | Processing tool call: {function_name} with arguments {function_args}"
                 )
                 print()
 
+                tool_message = {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "name": function_name,
+                    "content": "",
+                }
                 match function_name:
                     case "bash_tool":
                         tool_result = await bash_tool(
@@ -181,40 +565,62 @@ async def chat_with_agent(user_message_content):
                         )
                     case _:
                         tool_result = {
-                            "success": False,
-                            "error": (
-                                f"The function name '{function_name}' is not recognized. "
-                                "Please review your tool definitions and retry using only the "
-                                "exact tool names provided in your configuration."
-                            ),
+                            "data": None,
+                            "metadata": {
+                                "success": False,
+                                "error": (
+                                    f"The function name '{function_name}' is not recognized. "
+                                    "Please review your tool definitions and retry using only the "
+                                    "exact tool names provided in your configuration."
+                                ),
+                            },
                         }
 
+                tool_message["content"] = await save_artifacts(
+                    tool_call["id"], tool_result
+                )
+
                 # Append the execution result to history using the tool role and call ID
-                tool_message = {
-                    "role": "tool",
-                    "tool_call_id": tool_call["id"],
-                    "name": function_name,
-                    "content": json.dumps(tool_result),
-                }
                 yield tool_message
                 messages.append(tool_message)
 
 
 async def main(argv):
-    from prompt_toolkit import PromptSession
+    global messages
 
     session = PromptSession()
 
     while True:
         user_message_content = await session.prompt_async("👤 💬 | ", multiline=True)
         print()
-        if user_message_content.lower() in ["exit", "quit"]:
+        if user_message_content.lower() in ["/exit", "/quit"]:
             break
+        elif user_message_content.lower() in ["/clear"]:
+            print("🧹 📜 | Clearing conversation history...")
+            print()
+            messages = copy.deepcopy(SYSTEM_MESSAGES)
+            continue
+        elif user_message_content.lower().startswith("/provider "):
+            provider_name = user_message_content.split(maxsplit=1)[1].strip().lower()
+            try:
+                provider = Provider(provider_name)
+                set_provider(provider)
+                print(f"🎚️  🔀 | Switched provider to {provider_name}")
+                print()
+            except ValueError:
+                print(
+                    f"🎚️  ⚠️  | Unknown provider: '{provider_name}'. "
+                    f"Valid options are: {', '.join(p.value for p in Provider)}"
+                )
+                print()
+            continue
 
         async for message in chat_with_agent(user_message_content):
             match message["role"]:
                 case "assistant":
-                    reasoning_content = message.get("reasoning_content")
+                    reasoning_content = message.get(
+                        "reasoning_content", message.get("reasoning")
+                    )
                     message_content = message.get("content")
                     # Agent reasoning
                     if (
@@ -234,7 +640,7 @@ async def main(argv):
                     )
                     print()
                 case _:
-                    print(f"Received message: {message}")
+                    print(f"❓ | Received message: {message}")
                     print()
                     raise ValueError(f"Unknown message role: {message['role']}")
 
@@ -245,4 +651,4 @@ if __name__ == "__main__":
 # docker compose up --build --watch
 # docker compose attach agent
 
-# docker compose run -it --rm agent
+# docker compose run -it --rm --service-ports agent
