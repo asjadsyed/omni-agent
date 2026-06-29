@@ -331,8 +331,8 @@ async def save_artifacts(tool_call_id: str, tool_result: dict) -> str:
     )
     preview = (
         output_str
-        if len(output_str) <= 200
-        else (output_str[:100] + "<TRUNCATED>" + output_str[-100:])
+        if len(output_str) <= 2000
+        else (output_str[:1000] + "<TRUNCATED>" + output_str[-1000:])
     )
     generic_metadata = {
         "preview": preview,
