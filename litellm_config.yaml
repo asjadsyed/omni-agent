@@ -1,0 +1,14 @@
+model_list:
+  - model_name: "*"
+    litellm_params:
+      model: "*"
+      custom_llm_provider: openai
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: os.environ/NVIDIA_API_KEY
+
+litellm_settings:
+  drop_params: true
+  use_chat_completions_url_for_anthropic_messages: true
+
+general_settings:
+  master_key: sk-litellm

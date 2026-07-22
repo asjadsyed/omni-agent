@@ -21,6 +21,8 @@ OPENROUTER_API_URL: str = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "OPENROUTER_API_KEY")
 NVIDIA_API_URL: str = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "NVIDIA_API_KEY")
+LITELLM_API_URL: str = "http://litellm:4000/v1/chat/completions"
+LITELLM_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "LITELLM_API_KEY")
 
 MODEL_ID = "openai/gpt-oss-20b"
 TOKENIZER = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -45,6 +47,7 @@ class Provider(enum.Enum):
     HF = "hf"
     OPENROUTER = "openrouter"
     NVIDIA = "nvidia"
+    LITELLM = "litellm"
 
 
 def set_provider(new_provider: Provider):
@@ -66,6 +69,9 @@ def set_provider(new_provider: Provider):
         case Provider.NVIDIA:
             api_url = NVIDIA_API_URL
             api_key = NVIDIA_API_KEY
+        case Provider.LITELLM:
+            api_url = LITELLM_API_URL
+            api_key = LITELLM_API_KEY
     headers["Authorization"] = f"Bearer {api_key}"
 
 

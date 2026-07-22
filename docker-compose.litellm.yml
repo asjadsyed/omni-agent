@@ -1,0 +1,33 @@
+services:
+  agent:
+    depends_on:
+      litellm:
+        condition: service_healthy
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable@sha256:a1745e629abfb17d434426ff48b115f54f4f4c4a0f5af241de569e93c63c411e
+    ports:
+      - "4000:4000"
+    environment:
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+    command:
+      - "--config"
+      - "/app/config.yaml"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "4000"
+      - "--debug"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/readiness')"
+      interval: 1s
+      timeout: 1s
+      retries: 30
+      start_period: 5s
