@@ -2,8 +2,10 @@
 import asyncio
 from collections.abc import AsyncGenerator
 import copy
+import dataclasses
 import enum
 import json
+import os
 import sys
 
 import dotenv
@@ -33,11 +35,8 @@ MAX_CONTEXT_TOKENS: int = 131_072
 # AND so the next tool result doesn't immediately trigger another trim.
 TRIM_TARGET_TOKENS: int = int(MAX_CONTEXT_TOKENS * 0.75)
 
-api_url: str = ""
-api_key: str = ""
 headers = {
     "Content-Type": "application/json",
-    "Authorization": f"Bearer {api_key}",
 }
 
 
@@ -50,32 +49,33 @@ class Provider(enum.Enum):
     LITELLM = "litellm"
 
 
+@dataclasses.dataclass(frozen=True)
+class ProviderAPIConfig:
+    api_url: str
+    api_key: str
+
+
+PROVIDER_API_CONFIG = {
+    Provider.LLAMA_CPP: ProviderAPIConfig(LLAMA_CPP_API_URL, LLAMA_CPP_API_KEY),
+    Provider.GROQ: ProviderAPIConfig(GROQ_API_URL, GROQ_API_KEY),
+    Provider.HF: ProviderAPIConfig(HF_API_URL, HF_API_KEY),
+    Provider.OPENROUTER: ProviderAPIConfig(OPENROUTER_API_URL, OPENROUTER_API_KEY),
+    Provider.NVIDIA: ProviderAPIConfig(NVIDIA_API_URL, NVIDIA_API_KEY),
+    Provider.LITELLM: ProviderAPIConfig(LITELLM_API_URL, LITELLM_API_KEY),
+}
+
+
+def get_provider_api_config() -> ProviderAPIConfig:
+    return PROVIDER_API_CONFIG[provider]
+
+
 def set_provider(new_provider: Provider):
-    global api_url, api_key, headers, provider
+    global headers, provider
     provider = new_provider
-    match provider:
-        case Provider.LLAMA_CPP:
-            api_url = LLAMA_CPP_API_URL
-            api_key = LLAMA_CPP_API_KEY
-        case Provider.GROQ:
-            api_url = GROQ_API_URL
-            api_key = GROQ_API_KEY
-        case Provider.HF:
-            api_url = HF_API_URL
-            api_key = HF_API_KEY
-        case Provider.OPENROUTER:
-            api_url = OPENROUTER_API_URL
-            api_key = OPENROUTER_API_KEY
-        case Provider.NVIDIA:
-            api_url = NVIDIA_API_URL
-            api_key = NVIDIA_API_KEY
-        case Provider.LITELLM:
-            api_url = LITELLM_API_URL
-            api_key = LITELLM_API_KEY
-    headers["Authorization"] = f"Bearer {api_key}"
+    headers["Authorization"] = f"Bearer {get_provider_api_config().api_key}"
 
 
-provider = Provider.LLAMA_CPP
+provider = Provider(os.getenv("PROVIDER", "llama-cpp"))
 set_provider(provider)
 
 
@@ -376,7 +376,7 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
         # print("Sending messages for inference...")
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                api_url, headers=headers, json=payload, timeout=None
+                get_provider_api_config().api_url, headers=headers, json=payload, timeout=None
             )
 
         response_data = response.json()
