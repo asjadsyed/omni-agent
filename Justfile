@@ -5,6 +5,8 @@ MODEL_URL := "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-
 default:
     @just --choose
 
+build provider="llama_cpp":
+    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" build --progress=plain
 
 up provider="llama_cpp":
     docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" up --build --detach
