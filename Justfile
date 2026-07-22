@@ -1,6 +1,10 @@
+MODEL := "./models/gpt-oss-20b-MXFP4.gguf"
+MODEL_URL := "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf?download=true"
+
 [private]
 default:
     @just --choose
+
 
 up:
     docker compose up --build --detach
@@ -15,8 +19,9 @@ down-volumes:
     docker compose down --volumes
 
 [script("bash")]
-run:
+run provider="litellm":
     set -Eeuo pipefail
+    just init "{{provider}}"
 
     cleanup() {
     	status="$1"
@@ -31,3 +36,10 @@ run:
     trap 'cleanup 143' TERM
 
     docker compose run --rm --service-ports --build agent
+
+[script("bash")]
+init provider="llama.cpp":
+    if [ "{{provider}}" = "llama.cpp" ]; then
+        mkdir -p models
+        wget -c -O "{{MODEL}}" "{{MODEL_URL}}"
+    fi
