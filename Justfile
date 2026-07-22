@@ -6,19 +6,19 @@ default:
     @just --choose
 
 build provider="llama_cpp":
-    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" build --progress=plain
+    PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" build --progress=plain
 
 up provider="llama_cpp":
-    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" up --build --detach
+    PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" up --build --detach
 
 attach provider="llama_cpp":
-    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" attach agent
+    PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" attach agent
 
 down provider="llama_cpp":
-    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down
+    PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down --remove-orphans
 
 down-volumes provider="llama_cpp":
-    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down --volumes
+    PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down --remove-orphans --volumes
 
 [script("bash")]
 run provider="llama_cpp":
@@ -28,7 +28,7 @@ run provider="llama_cpp":
     cleanup() {
     	status="$1"
     	trap - EXIT INT TERM HUP
-    	docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down >/dev/null 2>&1 || true
+    	PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down >/dev/null 2>&1 || true
     	exit "$status"
     }
 
@@ -37,7 +37,7 @@ run provider="llama_cpp":
     trap 'cleanup 130' INT
     trap 'cleanup 143' TERM
 
-    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" run --rm --service-ports --build agent
+    PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" run --rm --service-ports --build agent
 
 [script("bash")]
 init provider="llama_cpp":
