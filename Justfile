@@ -6,27 +6,27 @@ default:
     @just --choose
 
 
-up:
-    docker compose up --build --detach
+up provider="llama_cpp":
+    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" up --build --detach
 
-attach:
-    docker compose attach agent
+attach provider="llama_cpp":
+    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" attach agent
 
-down:
-    docker compose down
+down provider="llama_cpp":
+    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down
 
-down-volumes:
-    docker compose down --volumes
+down-volumes provider="llama_cpp":
+    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down --volumes
 
 [script("bash")]
-run provider="litellm":
+run provider="llama_cpp":
     set -Eeuo pipefail
     just init "{{provider}}"
 
     cleanup() {
     	status="$1"
     	trap - EXIT INT TERM HUP
-    	docker compose down >/dev/null 2>&1 || true
+    	docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down >/dev/null 2>&1 || true
     	exit "$status"
     }
 
@@ -35,11 +35,11 @@ run provider="litellm":
     trap 'cleanup 130' INT
     trap 'cleanup 143' TERM
 
-    docker compose run --rm --service-ports --build agent
+    docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" run --rm --service-ports --build agent
 
 [script("bash")]
-init provider="llama.cpp":
-    if [ "{{provider}}" = "llama.cpp" ]; then
+init provider="llama_cpp":
+    if [ "{{provider}}" = "llama_cpp" ]; then
         mkdir -p models
         wget -c -O "{{MODEL}}" "{{MODEL_URL}}"
     fi

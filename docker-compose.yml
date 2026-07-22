@@ -1,66 +1,9 @@
 services:
-
-  llama-cpp:
-    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
-    restart: unless-stopped
-
-    devices:
-      # - /dev/kfd
-      - /dev/dri
-
-    # group_add:
-    #   - video
-    #   - render
-    group_add:
-      - "107"  # Standard GID for 'input' / 'video' on many systems
-      - "109"  # Standard GID for 'render' on modern Linux systems
-
-    ports:
-      - "8080:8080"
-
-    volumes:
-      - ./models:/models
-
-    environment:
-      # HIP_VISIBLE_DEVICES: "1"
-      GGML_VULKAN_DEVICE: "1" 
-      
-      LLAMA_ARG_MODEL: /models/gpt-oss-20b-MXFP4.gguf
-      LLAMA_ARG_CTX_SIZE: "131072"
-      LLAMA_ARG_N_GPU_LAYERS: "99"
-      LLAMA_ARG_THREADS: "16"
-
-      # HSA_OVERRIDE_GFX_VERSION: "11.0.0"
-      LLAMA_ARG_BATCH_SIZE: "512"
-      LLAMA_ARG_UBATCH_SIZE: "512"
-
-      LLAMA_ARG_FLASH_ATTN: "1"
-
-      LLAMA_ARG_HOST: 0.0.0.0
-      LLAMA_ARG_PORT: "8080"
-
-    security_opt:
-      - seccomp=unconfined
-    
-    healthcheck:
-      test:
-        - "CMD"
-        - "python3"
-        - "-c"
-        - "import urllib.request, sys; res = urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=1); sys.exit(0 if res.getcode() == 200 else 1)"
-      interval: 1s
-      timeout: 1s
-      retries: 30
-      start_period: 5s
-
   agent:
     build:
       context: agent
       dockerfile: agent.Dockerfile
     restart: unless-stopped
-    depends_on:
-      llama-cpp:
-        condition: service_healthy
     develop:
       watch:
         - action: rebuild
