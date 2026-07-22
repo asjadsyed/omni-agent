@@ -13,7 +13,7 @@ import httpx
 from prompt_toolkit import PromptSession
 from transformers import AutoTokenizer
 
-LLAMA_CPP_API_URL: str = "http://llama-cpp:8080/v1/chat/completions"
+LLAMA_CPP_API_URL: str = "http://llama_cpp:8080/v1/chat/completions"
 LLAMA_CPP_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "LLAMA_CPP_API_KEY")
 GROQ_API_URL: str = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "GROQ_API_KEY")
@@ -41,7 +41,7 @@ headers = {
 
 
 class Provider(enum.Enum):
-    LLAMA_CPP = "llama-cpp"
+    LLAMA_CPP = "llama_cpp"
     GROQ = "groq"
     HF = "hf"
     OPENROUTER = "openrouter"
@@ -75,7 +75,7 @@ def set_provider(new_provider: Provider):
     headers["Authorization"] = f"Bearer {get_provider_api_config().api_key}"
 
 
-provider = Provider(os.getenv("PROVIDER", "llama-cpp"))
+provider = Provider(os.getenv("PROVIDER", "llama_cpp"))
 set_provider(provider)
 
 

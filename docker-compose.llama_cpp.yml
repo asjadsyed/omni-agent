@@ -1,10 +1,10 @@
 services:
   agent:
     depends_on:
-      llama-cpp:
+      llama_cpp:
         condition: service_healthy
 
-  llama-cpp:
+  llama_cpp:
     image: ghcr.io/ggml-org/llama.cpp:server-vulkan
     restart: unless-stopped
 
