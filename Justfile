@@ -5,23 +5,23 @@ MODEL_URL := "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-
 default:
     @just --choose
 
-build provider="llama_cpp":
+build provider="nvidia":
     PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" build --progress=plain
 
-up provider="llama_cpp":
+up provider="nvidia":
     PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" up --build --detach
 
-attach provider="llama_cpp":
+attach provider="nvidia":
     PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" attach agent
 
-down provider="llama_cpp":
+down provider="nvidia":
     PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down --remove-orphans
 
-down-volumes provider="llama_cpp":
+down-volumes provider="nvidia":
     PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down --remove-orphans --volumes
 
 [script("bash")]
-run provider="llama_cpp":
+run provider="nvidia":
     set -Eeuo pipefail
     just init "{{provider}}"
 

@@ -75,7 +75,7 @@ def set_provider(new_provider: Provider):
     headers["Authorization"] = f"Bearer {get_provider_api_config().api_key}"
 
 
-provider = Provider(os.getenv("PROVIDER", "llama_cpp"))
+provider = Provider(os.getenv("PROVIDER") or Provider.NVIDIA.value)
 set_provider(provider)
 
 
