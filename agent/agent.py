@@ -26,9 +26,17 @@ NVIDIA_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "NVIDIA_API_KEY")
 LITELLM_API_URL: str = "http://litellm:4000/v1/chat/completions"
 LITELLM_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "LITELLM_API_KEY")
 
-MODEL_ID = "openai/gpt-oss-20b"
-TOKENIZER_MODEL_ID = "openai/gpt-oss-20b"
+# MODEL_ID = "openai/gpt-oss-20b"
+# TOKENIZER_MODEL_ID = "openai/gpt-oss-20b"
+MODEL_ID = "z-ai/glm-5.2"
+TOKENIZER_MODEL_ID = "zai-org/GLM-5.2"
+# MODEL_ID = "poolside/laguna-xs-2.1"
+# TOKENIZER_MODEL_ID = "poolside/Laguna-XS-2.1"
 TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_MODEL_ID)
+MODEL_IDS_WITH_TOOL_ARGUMENTS_AS_DICTS = {
+    "zai-org/GLM-5.2",
+    "poolside/Laguna-XS-2.1",
+}
 
 ARTIFACT_DIR = "/artifacts"
 
@@ -183,13 +191,25 @@ Only seek user input when information, resources, or decisions are required that
 messages = copy.deepcopy(SYSTEM_MESSAGES)
 
 
+def get_tokenizer_compatible_messages(messages):
+    if TOKENIZER_MODEL_ID in MODEL_IDS_WITH_TOOL_ARGUMENTS_AS_DICTS:
+        messages = copy.deepcopy(messages)
+        for assistant_message in messages:
+            if assistant_message.get("tool_calls"):
+                for tool_call in assistant_message["tool_calls"]:
+                    arguments = tool_call["function"].get("arguments")
+                    if isinstance(arguments, str):
+                        tool_call["function"]["arguments"] = json.loads(arguments)
+    return messages
+
+
 def count_tokens(messages):
     """
     Count the exact number of tokens that would be sent to the model
     for the given conversation history using the model's tokenizer.
     """
     encoded = TOKENIZER.apply_chat_template(
-        messages,
+        get_tokenizer_compatible_messages(messages),
         add_generation_prompt=True,
         tokenize=True,
         return_dict=True,
