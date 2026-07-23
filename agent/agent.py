@@ -27,7 +27,9 @@ LITELLM_API_URL: str = "http://litellm:4000/v1/chat/completions"
 LITELLM_API_KEY: str = dotenv.get_key(dotenv.find_dotenv(), "LITELLM_API_KEY")
 
 MODEL_ID = "openai/gpt-oss-20b"
-TOKENIZER = AutoTokenizer.from_pretrained(MODEL_ID)
+TOKENIZER_MODEL_ID = "openai/gpt-oss-20b"
+TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_MODEL_ID)
+
 ARTIFACT_DIR = "/artifacts"
 
 MAX_CONTEXT_TOKENS: int = 131_072
