@@ -74,6 +74,13 @@ PROVIDER_API_CONFIG = {
     Provider.LITELLM: ProviderAPIConfig(LITELLM_API_URL, LITELLM_API_KEY),
 }
 
+INFERENCE_TIMEOUT = httpx.Timeout(
+    connect=10.0,
+    write=120.0,
+    read=600.0,
+    pool=15.0,
+)
+
 
 def get_provider_api_config() -> ProviderAPIConfig:
     return PROVIDER_API_CONFIG[provider]
@@ -396,10 +403,24 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
         }
 
         # print("Sending messages for inference...")
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                get_provider_api_config().api_url, headers=headers, json=payload, timeout=None
-            )
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    get_provider_api_config().api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=INFERENCE_TIMEOUT,
+                )
+        except httpx.TimeoutException as e:
+            print(f"⏱️  🔄 | Inference timeout, retrying due to {type(e).__name__}")
+            print()
+            await asyncio.sleep(5)
+            continue
+        except httpx.RequestError as e:
+            print(f"🌐 🔄 | Inference request failed, retrying due to {type(e).__name__}")
+            print()
+            await asyncio.sleep(5)
+            continue
 
         response_data = response.json()
 
