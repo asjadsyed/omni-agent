@@ -18,6 +18,7 @@ attach provider="nvidia":
 down provider="nvidia":
     PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down --remove-orphans
 
+[confirm("Warning: this will permanently delete stored data. Continue?")]
 down-volumes provider="nvidia":
     PROVIDER="{{provider}}" docker compose -f docker-compose.yml -f "docker-compose.{{provider}}.yml" down --remove-orphans --volumes
 
