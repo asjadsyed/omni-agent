@@ -1,4 +1,5 @@
 MODEL := "./models/gpt-oss-20b-MXFP4.gguf"
+MODEL_SIZE_FILE := MODEL + ".size"
 MODEL_URL := "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf?download=true"
 
 [private]
@@ -43,5 +44,16 @@ run provider="nvidia":
 init provider="llama_cpp":
     if [ "{{provider}}" = "llama_cpp" ]; then
         mkdir -p models
-        wget -c -O "{{MODEL}}" "{{MODEL_URL}}"
+
+        local_size=$(python3 -c 'import os,sys; print(os.path.getsize(sys.argv[1]))' "{{MODEL}}" 2>/dev/null || echo 0)
+        if [ -f "{{MODEL_SIZE_FILE}}" ]; then
+            remote_size=$(cat "{{MODEL_SIZE_FILE}}")
+        else
+            remote_size=$(curl -fsSLI "{{MODEL_URL}}" | awk 'tolower($1)=="content-length:" {size=$2} END {print size}' | tr -d '\r')
+            echo "$remote_size" > "{{MODEL_SIZE_FILE}}"
+        fi
+
+        if [ "$local_size" != "$remote_size" ]; then
+            wget -c -O "{{MODEL}}" "{{MODEL_URL}}"
+        fi
     fi
