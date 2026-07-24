@@ -1,5 +1,5 @@
-MODEL := "./models/gpt-oss-20b-MXFP4.gguf"
-MODEL_SIZE_FILE := MODEL + ".size"
+MODEL_PATH := "./models/gpt-oss-20b-MXFP4.gguf"
+MODEL_SIZE_FILE_PATH := MODEL_PATH + ".size"
 MODEL_URL := "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf?download=true"
 
 [private]
@@ -46,15 +46,15 @@ init provider="llama_cpp":
     if [ "{{provider}}" = "llama_cpp" ]; then
         mkdir -p models
 
-        local_size=$(python3 -c 'import os,sys; print(os.path.getsize(sys.argv[1]))' "{{MODEL}}" 2>/dev/null || echo 0)
-        if [ -f "{{MODEL_SIZE_FILE}}" ]; then
-            remote_size=$(cat "{{MODEL_SIZE_FILE}}")
+        local_size=$(python3 -c 'import os,sys; print(os.path.getsize(sys.argv[1]))' "{{MODEL_PATH}}" 2>/dev/null || echo 0)
+        if [ -f "{{MODEL_SIZE_FILE_PATH}}" ]; then
+            remote_size=$(cat "{{MODEL_SIZE_FILE_PATH}}")
         else
             remote_size=$(curl -fsSLI "{{MODEL_URL}}" | awk 'tolower($1)=="content-length:" {size=$2} END {print size}' | tr -d '\r')
-            echo "$remote_size" > "{{MODEL_SIZE_FILE}}"
+            echo "$remote_size" > "{{MODEL_SIZE_FILE_PATH}}"
         fi
 
         if [ "$local_size" != "$remote_size" ]; then
-            wget -c -O "{{MODEL}}" "{{MODEL_URL}}"
+            wget -c -O "{{MODEL_PATH}}" "{{MODEL_URL}}"
         fi
     fi
