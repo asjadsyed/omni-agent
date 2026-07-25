@@ -106,7 +106,7 @@ async def bash_tool(command: str):
     )
     stdout, stderr = await result.communicate()
     return {
-        "data": stdout.decode().strip(),
+        "data": stdout.decode(errors="replace").strip(),
         "metadata": {
             "success": result.returncode == 0,
             "returncode": result.returncode,
@@ -358,7 +358,7 @@ async def save_artifacts(tool_call_id: str, tool_result: dict) -> str:
             stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await proc.communicate()
-        return stdout.decode().strip()
+        return stdout.decode(errors="replace").strip()
 
     data = tool_result["data"]
     output_str = (
