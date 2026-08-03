@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import asyncio
-from collections.abc import AsyncGenerator
 import copy
 import dataclasses
 import enum
 import json
 import os
 import sys
+from collections.abc import AsyncGenerator
 
 import dotenv
 import httpx
@@ -32,6 +32,7 @@ MODEL_ID = "z-ai/glm-5.2"
 TOKENIZER_MODEL_ID = "zai-org/GLM-5.2"
 # MODEL_ID = "poolside/laguna-xs-2.1"
 # TOKENIZER_MODEL_ID = "poolside/Laguna-XS-2.1"
+
 TOKENIZER = AutoTokenizer.from_pretrained(TOKENIZER_MODEL_ID)
 MODEL_IDS_WITH_TOOL_ARGUMENTS_AS_DICTS = {
     "zai-org/GLM-5.2",
@@ -44,6 +45,21 @@ MAX_CONTEXT_TOKENS: int = 131_072
 # Aim well below the hard cap so the model has room to produce a long response
 # AND so the next tool result doesn't immediately trigger another trim.
 TRIM_TARGET_TOKENS: int = int(MAX_CONTEXT_TOKENS * 0.75)
+
+STATE_FILE: str = f"{ARTIFACT_DIR}/agent_state.json"
+COMPACT_THRESHOLD: int = int(MAX_CONTEXT_TOKENS * 0.85)
+COMPACT_KEEP_TOKENS: int = int(MAX_CONTEXT_TOKENS * 0.40)
+
+FLUSH_NUDGE = "flush_nudge"
+EXCHANGE_SUMMARY = "exchange_summary"
+COMPACTION_SUMMARY = "compaction_summary"
+STATE_HINT = "state_hint"
+ERROR_INJECTION = "error_injection"
+PROTECTED_TYPES = {EXCHANGE_SUMMARY, COMPACTION_SUMMARY, STATE_HINT}
+
+MAX_FLUSH_WAIT_TURNS = 4
+
+_emergency_ceiling: int | None = None
 
 headers = {
     "Content-Type": "application/json",
@@ -87,7 +103,7 @@ def get_provider_api_config() -> ProviderAPIConfig:
 
 
 def set_provider(new_provider: Provider):
-    global headers, provider
+    global provider
     provider = new_provider
     headers["Authorization"] = f"Bearer {get_provider_api_config().api_key}"
 
@@ -104,7 +120,7 @@ async def bash_tool(command: str):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    stdout, stderr = await result.communicate()
+    stdout, _stderr = await result.communicate()
     return {
         "data": stdout.decode(errors="replace").strip(),
         "metadata": {
@@ -210,7 +226,7 @@ def get_tokenizer_compatible_messages(messages):
     return messages
 
 
-def count_tokens(messages):
+def count_tokens(messages, verbose=True):
     """
     Count the exact number of tokens that would be sent to the model
     for the given conversation history using the model's tokenizer.
@@ -222,71 +238,138 @@ def count_tokens(messages):
         return_dict=True,
     )
     token_count = len(encoded["input_ids"])
-    print(f"🧩 🧮 | Token count: {token_count}")
-    print()
+    if verbose:
+        print(f"🧩 🧮 | Token count: {token_count}")
+        print()
     return token_count
 
 
-async def trim_context() -> None:
+async def trim_context(*, force: bool = False) -> None:
     """
-    Trim the global ``messages`` list to TRIM_TARGET_TOKENS when it exceeds
-    MAX_CONTEXT_TOKENS.
+    All context management in one place. Call at the top of every agent loop iteration.
 
-    Strategy
-    --------
-    Phase 1 - Drop complete old exchanges, oldest first.
-        An "exchange" is one user message plus every assistant/tool turn that
-        follows, up to (but not including) the next user message. The final
-        exchange (the current in-progress request) is never dropped.
+    Stage 1  >= 85%  STATE_FILE missing -> request state save, return early.
+                       After MAX_FLUSH_WAIT_TURNS agent turns without it, compact anyway.
+    Stage 2  >= 85%  LLM compaction: summarize old messages, keep recent tail verbatim.
+    Stage 3          Structural trim: exchanges -> tool groups -> ephemeral msgs -> offloads -> drops.
+                       Fires at TRIM_TARGET if compaction failed, MAX_CONTEXT if it succeeded.
 
-    Phase 2 - Drop inner tool-call groups from the surviving exchange.
-        If the current exchange alone is still too large, iteratively remove
-        its oldest (assistant-with-tool_calls + tool-result) block. The user
-        message and any final plain-text assistant reply are left untouched.
+    force=True skips the normal compaction flow and immediately performs
+    structural trimming. Used after a 413 response so the next retry always
+    sends a smaller request.
     """
-    global messages
 
-    token_count = count_tokens(messages)
-    if token_count <= MAX_CONTEXT_TOKENS:
-        return
+    # ── helpers ───────────────────────────────────────────────────────────────
 
-    print(
-        f"🗜️  | {token_count}/{MAX_CONTEXT_TOKENS} tokens - trimming to <= {TRIM_TARGET_TOKENS}"
-    )
+    async def call_llm(payload, max_tokens=2048):
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                get_provider_api_config().api_url,
+                headers=headers,
+                json={
+                    "model": MODEL_ID,
+                    "messages": payload,
+                    "max_tokens": max_tokens,
+                },
+                timeout=120,
+            )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"].get("content", "")
 
-    # ── helpers ────────────────────────────────────────────────────────────────
+    def serialise(msgs):
+        parts = []
+        for msg in msgs:
+            role = msg.get("role", "?")
+            if role == "assistant":
+                body = []
+                if reasoning := (
+                    msg.get("reasoning_content") or msg.get("reasoning", "")
+                ).strip():
+                    body.append(f"<reasoning>{reasoning}</reasoning>")
+                if content := (msg.get("content") or "").strip():
+                    body.append(content)
+                for tool_call in msg.get("tool_calls") or []:
+                    body.append(
+                        f"<call id={tool_call['id']}>{tool_call['function']['name']}({tool_call['function']['arguments']})</call>"
+                    )
+                parts.append("[ASSISTANT]\n" + "\n".join(body))
+            elif role == "tool":
+                parts.append(
+                    f"[TOOL id={msg.get('tool_call_id','?')} name={msg.get('name','?')}]\n{(msg.get('content') or '').strip()}"
+                )
+            else:
+                parts.append(f"[{role.upper()}]\n{(msg.get('content') or '').strip()}")
+        return "\n\n---\n\n".join(parts)
 
-    def exchange_slices(msgs: list[dict]) -> list[tuple[int, int]]:
+    async def summarize(head):
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "Summarize this agent session so the agent can resume without re-doing work. "
+                    "Include: GOAL, COMPLETED STEPS (outcomes), DISCOVERED FACTS (exact paths/values/IDs), "
+                    "ERRORS & RECOVERY, REMAINING WORK (ordered), KEY ARTIFACTS. "
+                    "Past tense. No commentary. Preserve exact values."
+                ),
+            },
+            {"role": "user", "content": "Summarize:\n\n" + serialise(head)},
+        ]
+        try:
+            return (await call_llm(prompt)).strip()
+        except httpx.HTTPError as e:
+            print(f"🗜️  🪓 | Summarization failed ({e}) - using truncated fallback")
+            print()
+            serialised = serialise(head)
+            return (
+                serialised[:1500]
+                + f"\n\n[…{len(serialised)-3000}c omitted…]\n\n"
+                + serialised[-1500:]
+                if len(serialised) > 3000
+                else serialised
+            )
+
+    def compact_boundary(rest, keep_tokens):
         """
-        Return [(start, end), ...] where each half-open slice covers one exchange.
-
-        System messages sit before the first user message and are naturally
-        excluded because we index by user-message positions.
+        Split index so rest[boundary:] fits within keep_tokens.
+        Boundary always lands on a user message, so every candidate tail
+        is a structurally valid conversation for count_tokens.
+        The last user message (the current request) is always protected.
         """
-        user_pos = [i for i, m in enumerate(msgs) if m["role"] == "user"]
+        user_positions = [i for i, msg in enumerate(rest) if msg["role"] == "user"]
+        if not user_positions:
+            return 0
+
+        last_user = user_positions[-1]
+        boundary = last_user  # fallback: keep only the last exchange
+
+        # Walk oldest -> newest (excluding the current request).
+        # Tails shrink monotonically as positions get more recent, so the
+        # first position whose tail fits is the oldest valid split -
+        # maximising how much history we keep verbatim.
+        for pos in user_positions[:-1]:
+            if count_tokens(rest[pos:]) <= keep_tokens:
+                boundary = pos
+                break
+
+        return boundary
+
+    def get_exchanges():
+        user_positions = [i for i, msg in enumerate(messages) if msg["role"] == "user"]
         return [
             (
                 start,
-                user_pos[k + 1] if k + 1 < len(user_pos) else len(msgs),
+                user_positions[k + 1] if k + 1 < len(user_positions) else len(messages),
             )
-            for k, start in enumerate(user_pos)
+            for k, start in enumerate(user_positions)
         ]
 
-    def tool_call_groups(msgs: list[dict], lo: int, hi: int) -> list[tuple[int, int]]:
-        """
-        Within msgs[lo:hi] find each atomic (assistant-with-tool_calls +
-        following tool messages) block. Returns absolute indices into msgs.
-
-        An assistant message without tool_calls (plain text) is NOT a group;
-        neither is a bare user message. We never yield those, so callers
-        never accidentally drop them.
-        """
+    def get_tool_groups(start, end):
         groups: list[tuple[int, int]] = []
-        i = lo
-        while i < hi:
-            if msgs[i]["role"] == "assistant" and msgs[i].get("tool_calls"):
+        i = start
+        while i < end:
+            if messages[i]["role"] == "assistant" and messages[i].get("tool_calls"):
                 j = i + 1
-                while j < hi and msgs[j]["role"] == "tool":
+                while j < end and messages[j]["role"] == "tool":
                     j += 1
                 groups.append((i, j))
                 i = j
@@ -294,49 +377,376 @@ async def trim_context() -> None:
                 i += 1
         return groups
 
-    # ── Phase 1: drop complete old exchanges ───────────────────────────────────
+    def state_file_valid():
+        try:
+            with open(STATE_FILE) as f:
+                return bool(json.load(f))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return False
 
-    exchanges = exchange_slices(messages)
-    while count_tokens(messages) > TRIM_TARGET_TOKENS and len(exchanges) > 1:
-        start, end = exchanges[0]
-        print(
-            f"🗜️  | dropping exchange [{start}:{end}] "
-            f"roles={[m['role'] for m in messages[start:end]]}"
+    # ── main logic ────────────────────────────────────────────────────────────
+
+    token_count = count_tokens(messages)
+    tokens_before = token_count
+    will_trim_context: bool = force or token_count >= COMPACT_THRESHOLD
+    try:
+        if not will_trim_context:
+            return
+
+        # ── stage 1: request state save / stage 2: LLM compaction (both >= 85%) ─
+
+        compaction_succeeded = False
+        if not force:
+            if not state_file_valid():
+                nudge_indices = [
+                    i
+                    for i, msg in enumerate(messages)
+                    if msg.get("_type") == FLUSH_NUDGE and msg["role"] == "system"
+                ]
+                if nudge_indices:
+                    turns_since_nudge = sum(
+                        1
+                        for msg in messages[nudge_indices[-1] :]
+                        if msg["role"] == "assistant"
+                    )
+                    if turns_since_nudge < MAX_FLUSH_WAIT_TURNS:
+                        return
+                    # Delete the stale FLUSH_NUDGE message. Otherwise, the next time
+                    # the context grows beyond COMPACT_THRESHOLD, we'd find the same FLUSH_NUDGE
+                    # message and skip asking the agent to flush its state.
+                    messages[:] = [
+                        msg
+                        for msg in messages
+                        if not (
+                            msg.get("_type") == FLUSH_NUDGE and msg["role"] == "system"
+                        )
+                    ]
+                    print(
+                        "🗜️  💨 | Agent did not save state - compacting without state file"
+                    )
+                    print()
+                else:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "_type": FLUSH_NUDGE,
+                            "content": (
+                                f"⚠️ Context {token_count}/{MAX_CONTEXT_TOKENS} tokens - nearing capacity. "
+                                f"Call bash_tool to write working state to `{STATE_FILE}` as JSON with keys: "
+                                f"goal, completed, discovered, errors, remaining, artifacts. "
+                                f"File persists through compaction. Then continue normally."
+                            ),
+                        }
+                    )
+                    print("🗜️  📡 | Requesting state save before compaction")
+                    print()
+                    return
+
+            original_contents = {msg.get("content", "") for msg in SYSTEM_MESSAGES}
+            system_header = [
+                msg
+                for msg in messages
+                if msg["role"] == "system"
+                and msg.get("content", "") in original_contents
+            ]
+            rest = [
+                msg
+                for msg in messages
+                if not (
+                    msg["role"] == "system"
+                    and msg.get("content", "") in original_contents
+                )
+            ]
+            boundary = compact_boundary(rest, COMPACT_KEEP_TOKENS)
+            head, tail = rest[:boundary], rest[boundary:]
+            if head and any(msg["role"] != "system" for msg in head):
+                head_tokens = count_tokens(head)
+                print(
+                    f"🗜️  🤏 | Compacting {head_tokens} tokens of history, keeping {count_tokens(tail)} tokens"
+                )
+                print()
+                summarizable = [
+                    msg for msg in head if msg.get("_type") != ERROR_INJECTION
+                ]
+                summary = {
+                    "role": "system",
+                    "_type": COMPACTION_SUMMARY,
+                    "content": (
+                        "## Compacted History\n\n" + await summarize(summarizable)
+                    ),
+                }
+                if count_tokens([summary]) < head_tokens:
+                    messages.clear()
+                    messages.extend(system_header + [summary] + tail)
+                    messages.append(
+                        {
+                            "role": "system",
+                            "_type": STATE_HINT,
+                            "content": f"Working state is at `{STATE_FILE}` - read it if you need context from before compaction.",
+                        }
+                    )
+                    compaction_succeeded = True
+                else:
+                    print(
+                        "🗜️  🤏 | Compaction skipped: summary was not smaller than the original"
+                    )
+                    print()
+
+        # ── stage 3: structural trim ───────────────────────────────────────────
+        # We determine the target token limit based on the current state.
+        # If a 413 error forced this trim, we aggressively cut to 75% of the active ceiling
+        # to ensure there is room for a response. Otherwise, if the LLM successfully
+        # compacted the history, we are lenient and allow the full maximum limit to avoid
+        # unnecessary destructive trimming. If compaction failed, we fall back to a deep
+        # structural cut down to our 75% target, creating a buffer so the agent can run
+        # for many turns before hitting the limit again.
+
+        system_floor = count_tokens(SYSTEM_MESSAGES)
+        current_ceiling = _emergency_ceiling or MAX_CONTEXT_TOKENS
+        candidate_ceiling = current_ceiling
+        effective_ceiling = max(candidate_ceiling, system_floor)
+        effective_target = (
+            effective_ceiling
+            if force
+            else (MAX_CONTEXT_TOKENS if compaction_succeeded else TRIM_TARGET_TOKENS)
         )
-        del messages[start:end]
-        exchanges = exchange_slices(messages)  # recalculate; indices shifted
-
-    if count_tokens(messages) <= TRIM_TARGET_TOKENS:
-        print(f"🗜️  | done after Phase 1 - {count_tokens(messages)} tokens")
-        return
-
-    # ── Phase 2: current exchange is still too large ───────────────────────────
-
-    print("🗜️  | Phase 2 - dropping inner tool groups from current exchange...")
-    exchanges = exchange_slices(messages)
-    if not exchanges:
-        return
-
-    ex_start, ex_end = exchanges[0]  # only one exchange remains
-
-    while count_tokens(messages) > TRIM_TARGET_TOKENS:
-        groups = tool_call_groups(messages, ex_start, ex_end)
-
-        if not groups:
-            # All that's left is the user message (and maybe a plain assistant
-            # reply).  We cannot trim further without destroying the request.
-            print("🗜️  | no tool groups left - context cannot be reduced further")
-            break
-
-        g_start, g_end = groups[0]
+        token_count = count_tokens(messages)
+        if token_count <= effective_target:
+            return
         print(
-            f"🗜️  | dropping tool group [{g_start}:{g_end}] "
-            f"roles={[m['role'] for m in messages[g_start:g_end]]}"
+            f"🗜️  ✂️  | Over limit ({token_count}/{effective_target} target) - running structural trim"
         )
-        del messages[g_start:g_end]
-        ex_end -= g_end - g_start  # keep window consistent after in-place delete
+        print()
 
-    print(f"🗜️  | done after Phase 2 - {count_tokens(messages)} tokens")
+        # Phase 1: offload old exchanges to disk with concurrent LLM summaries.
+        # Only processes enough exchanges to cover the token deficit.
+        exchanges = get_exchanges()
+        if len(exchanges) > 1 and count_tokens(messages) > effective_target:
+            token_deficit = count_tokens(messages) - effective_target
+            accumulated, old_exchanges = 0, []
+            for start, end in exchanges[:-1]:
+                old_exchanges.append((start, end))
+                accumulated += count_tokens(messages[start:end])
+                if accumulated > token_deficit:
+                    break
+
+            offload_start = sum(
+                1
+                for f in os.listdir(ARTIFACT_DIR)
+                if f.startswith("exchange_") and f.endswith(".json")
+            )
+            tasks = []
+            for i, (start, end) in enumerate(old_exchanges):
+                content = [
+                    msg for msg in messages[start:end] if msg["role"] != "system"
+                ]
+                sys_msgs = [
+                    msg for msg in messages[start:end] if msg["role"] == "system"
+                ]
+                path = f"{ARTIFACT_DIR}/exchange_{offload_start + i:06d}.json"
+                try:
+                    with open(path, "w") as f:
+                        json.dump(content, f)
+                    tasks.append((start, end, content, sys_msgs, path))
+                except (OSError, TypeError) as e:
+                    print(
+                        f"🗜️  ⚠️  | Could not write exchange to disk ({e}) - skipping"
+                    )
+                    print()
+
+            summaries: list[str | None] = [None] * len(tasks)
+
+            async def _run_summarize(index, content):
+                summaries[index] = await summarize(content)
+
+            async with asyncio.TaskGroup() as tg:
+                for i, (_, _, content, _, _) in enumerate(tasks):
+                    tg.create_task(_run_summarize(i, content))
+
+            for (start, end, content, sys_msgs, path), summary_text in reversed(
+                list(zip(tasks, summaries))
+            ):
+                summary_msg = {
+                    "role": "system",
+                    "_type": EXCHANGE_SUMMARY,
+                    "content": f"[Exchange offloaded to `{path}`]\nSummary: {summary_text}",
+                }
+                del messages[start:end]
+                if count_tokens([summary_msg]) < count_tokens(content):
+                    messages.insert(start, summary_msg)
+                    for sys_msg in reversed(sys_msgs):
+                        messages.insert(start + 1, sys_msg)
+                else:
+                    for sys_msg in reversed(sys_msgs):
+                        messages.insert(start, sys_msg)
+                print(f"🗜️  💾 | Offloaded exchange to {os.path.basename(path)}")
+                print()
+
+        if count_tokens(messages) <= effective_target:
+            return
+
+        # Phase 2: drop tool-call groups in the surviving exchange
+        if not (exchanges := get_exchanges()):
+            return
+        ex_start, ex_end = exchanges[0]
+        while count_tokens(messages) > effective_target:
+            if not (groups := get_tool_groups(ex_start, ex_end)):
+                break
+            group_start, group_end = groups[0]
+            del messages[group_start:group_end]
+            ex_end -= group_end - group_start
+        if count_tokens(messages) <= effective_target:
+            return
+
+        # Phase 3a: ephemeral system messages (400 error notes, old nudges)
+        original_contents = {msg.get("content", "") for msg in SYSTEM_MESSAGES}
+        ephemeral = [
+            i
+            for i, msg in enumerate(messages)
+            if msg["role"] == "system"
+            and msg.get("content", "") not in original_contents
+            and msg.get("_type") not in PROTECTED_TYPES
+        ]
+        for idx in reversed(ephemeral):
+            del messages[idx]
+            if count_tokens(messages) <= effective_target:
+                return
+
+        # Phase 3b: offload user messages to disk, only if reference is smaller
+        offload_index = sum(
+            1
+            for f in os.listdir(ARTIFACT_DIR)
+            if f.startswith("offloaded_user_message_") and f.endswith(".txt")
+        )
+        for msg in (msg for msg in messages if msg["role"] == "user"):
+            raw = msg.get("content", "")
+            if not isinstance(raw, str) or not raw:
+                continue
+            path = f"{ARTIFACT_DIR}/offloaded_user_message_{offload_index}.txt"
+            reference = (
+                f"[User message offloaded to `{path}` - read it before responding]"
+            )
+            if count_tokens([{**msg, "content": reference}]) >= count_tokens([msg]):
+                continue
+            try:
+                with open(path, "w") as f:
+                    f.write(raw)
+            except OSError as e:
+                print(f"🗜️  ⚠️  | Could not offload user message ({e}) - skipping")
+                print()
+                continue
+            msg["content"] = reference
+            offload_index += 1
+            print(f"🗜️  💾 | Offloaded user message ({len(raw)} chars) to disk")
+            print()
+            if count_tokens(messages) <= effective_target:
+                return
+
+        # Phase 3c: plain assistant messages - offload if smaller, then drop
+        offload_index = sum(
+            1
+            for f in os.listdir(ARTIFACT_DIR)
+            if f.startswith("offloaded_assistant_message_") and f.endswith(".txt")
+        )
+        for i, msg in reversed(list(enumerate(messages))):
+            if msg["role"] != "assistant" or msg.get("tool_calls"):
+                continue
+            raw = msg.get("content", "")
+            if isinstance(raw, str) and raw:
+                path = f"{ARTIFACT_DIR}/offloaded_assistant_message_{offload_index}.txt"
+                reference = f"[Assistant response offloaded to `{path}`]"
+                if count_tokens([{**msg, "content": reference}]) < count_tokens([msg]):
+                    try:
+                        with open(path, "w") as f:
+                            f.write(raw)
+                        msg["content"] = reference
+                        offload_index += 1
+                        print(
+                            f"🗜️  💾 | Offloaded assistant response ({len(raw)} chars) to disk"
+                        )
+                        print()
+                        if count_tokens(messages) <= effective_target:
+                            return
+                    except OSError as e:
+                        print(
+                            f"🗜️  🪓 | Could not offload assistant response ({e}) - dropping instead"
+                        )
+                        print()
+            del messages[i]
+            print("🗜️  🪓 | Dropped assistant response to free context")
+            print()
+            if count_tokens(messages) <= effective_target:
+                return
+
+        # Phase 3d: drop exchange summaries - files remain on disk
+        for idx in reversed(
+            [
+                i
+                for i, msg in enumerate(messages)
+                if msg.get("_type") == EXCHANGE_SUMMARY
+            ]
+        ):
+            del messages[idx]
+            if count_tokens(messages) <= effective_target:
+                return
+
+        # Phase 3e: drop compaction summary and state hint - absolute last resort
+        for idx in reversed(
+            [
+                i
+                for i, msg in enumerate(messages)
+                if msg.get("_type") in {COMPACTION_SUMMARY, STATE_HINT}
+            ]
+        ):
+            del messages[idx]
+            if count_tokens(messages) <= effective_target:
+                return
+
+        print(
+            f"🗜️  💥 | Unable to reduce context to target ({effective_target}) - "
+            f"{count_tokens(messages)}/{MAX_CONTEXT_TOKENS} tokens remain"
+        )
+        print()
+
+    finally:
+        if will_trim_context:
+            tokens_after = count_tokens(messages)
+            if tokens_after != tokens_before:
+                print(
+                    f"🗜️  ℹ️  | {tokens_before} -> {tokens_after}/{MAX_CONTEXT_TOKENS} tokens"
+                )
+                print()
+
+
+def handle_clear() -> None:
+    global messages
+    messages = copy.deepcopy(SYSTEM_MESSAGES)
+    try:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+        removed = 0
+        for filename in os.listdir(ARTIFACT_DIR):
+            if (
+                filename.startswith("exchange_")
+                and filename.endswith(".json")
+                or filename.startswith("offloaded_assistant_message_")
+                and filename.endswith(".txt")
+                or filename.startswith("offloaded_user_message_")
+                and filename.endswith(".txt")
+            ):
+                os.remove(os.path.join(ARTIFACT_DIR, filename))
+                removed += 1
+        suffix = (
+            f" and removed {removed} offloaded file{'s' if removed != 1 else ''}"
+            if removed
+            else ""
+        )
+        print(f"🧹 📜 | Conversation cleared{suffix}")
+    except OSError as e:
+        print(
+            f"🧹 📜 | Conversation cleared (warning: could not remove some files: {e})"
+        )
+    print()
 
 
 async def save_artifacts(tool_call_id: str, tool_result: dict) -> str:
@@ -386,8 +796,6 @@ async def save_artifacts(tool_call_id: str, tool_result: dict) -> str:
 
 
 async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
-    global messages
-    global provider
     messages.append({"role": "user", "content": user_message_content})
 
     # Keep looping as long as the model wants to call tools
@@ -397,7 +805,10 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
         model = f"{MODEL_ID}:free" if provider == Provider.OPENROUTER else MODEL_ID
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": [
+                {k: v for k, v in msg.items() if not k.startswith("_")}
+                for msg in messages
+            ],
             "tools": TOOL_SCHEMAS,
             "tool_choice": "auto",
         }
@@ -417,7 +828,9 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
             await asyncio.sleep(5)
             continue
         except httpx.RequestError as e:
-            print(f"🌐 🔄 | Inference request failed, retrying due to {type(e).__name__}")
+            print(
+                f"🌐 🔄 | Inference request failed, retrying due to {type(e).__name__}"
+            )
             print()
             await asyncio.sleep(5)
             continue
@@ -442,6 +855,7 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
                     messages.append(
                         {
                             "role": "system",
+                            "_type": ERROR_INJECTION,
                             "content": (
                                 "The server rejected the previous request with a 400 Bad Request error. "
                                 "Review the raw server response below to identify what went wrong, "
@@ -451,7 +865,7 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
                         }
                     )
                     continue
-                case 429:
+                case 429 | 529:
                     retry_after = response.headers.get("Retry-After")
                     rate_limit_duration = 10
                     try:
@@ -465,12 +879,22 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
                     await asyncio.sleep(rate_limit_duration)
                     continue
                 case 413:
+                    global _emergency_ceiling
+                    # Reduce the assumed ceiling by 25% on each 413,
+                    # converging on the provider's real limit over time.
+                    system_floor = count_tokens(SYSTEM_MESSAGES)
+                    current_ceiling = _emergency_ceiling or MAX_CONTEXT_TOKENS
+                    candidate_ceiling = int(0.75 * current_ceiling)
+                    effective_ceiling = max(candidate_ceiling, system_floor)
+                    # Always leave room for at least one exchange
+                    _emergency_ceiling = effective_ceiling
                     print(
-                        "Request entity too large, compacting message history and retrying..."
+                        f"🛑 📦 | Payload too large - reducing budget to "
+                        f"{effective_ceiling} tokens and retrying..."
                     )
                     print()
+                    await trim_context(force=True)
                     await asyncio.sleep(10)
-                    # TODO
                     continue
                 case 500 | 502 | 503 | 504:
                     print(
@@ -481,10 +905,15 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
                     continue
                 case _:
                     print(
-                        f"⚠️  | Unexpected HTTP error ({status_code}): {response.text}"
+                        f"⚠️  🛑 | Unexpected HTTP error ({status_code}): {response.text}"
                     )
                     print()
                     response.raise_for_status()
+
+        # The request succeeded, so reset the emergency ceiling.
+        # A single 413 shouldn't reduce the context budget for the rest
+        # of the session.
+        _emergency_ceiling = None
 
         # Extract the assistant message dictionary
         assistant_message = response_data["choices"][0]["message"]
@@ -501,13 +930,20 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
 
         tool_calls = assistant_message.get("tool_calls")
 
+        # The request succeeded, so drop any ERROR_INJECTION messages.
+        messages[:] = [
+            msg
+            for msg in messages
+            if not (msg.get("_type") == ERROR_INJECTION and msg["role"] == "system")
+        ]
+
         # We must append the model's exact response containing the tool request to history
         yield assistant_message
         messages.append(assistant_message)
 
         finish_reason = response_data["choices"][0].get("finish_reason")
         stop_reason = response_data["choices"][0].get("stop_reason")
-        # 2000212 == <|call|>
+        # 200012 == <|call|>
         # https://developers.openai.com/cookbook/articles/openai-harmony#special-tokens
         if finish_reason == "stop" and stop_reason == 200012:
             print(
@@ -518,6 +954,7 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
             messages.append(
                 {
                     "role": "system",
+                    "_type": ERROR_INJECTION,
                     "content": "You halted to make a tool call but did not provide the command payload. Please emit the tool call parameters for the action you just described.",
                 }
             )
@@ -638,8 +1075,6 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
 
 
 async def main(argv):
-    global messages
-
     session = PromptSession()
 
     while True:
@@ -648,9 +1083,7 @@ async def main(argv):
         if user_message_content.lower() in ["/exit", "/quit"]:
             break
         elif user_message_content.lower() in ["/clear"]:
-            print("🧹 📜 | Clearing conversation history...")
-            print()
-            messages = copy.deepcopy(SYSTEM_MESSAGES)
+            handle_clear()
             continue
         elif user_message_content.lower().startswith("/provider "):
             provider_name = user_message_content.split(maxsplit=1)[1].strip().lower()
@@ -692,7 +1125,7 @@ async def main(argv):
                     )
                     print()
                 case _:
-                    print(f"❓ | Received message: {message}")
+                    print(f"❓ 💬 | Received message: {message}")
                     print()
                     raise ValueError(f"Unknown message role: {message['role']}")
 
