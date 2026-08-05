@@ -5,7 +5,7 @@ services:
         condition: service_healthy
 
   llama_cpp:
-    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan-b9592@sha256:c7a528c271d169982126d2a098844bb769719a2974022296a0771da85aafcb28
     restart: unless-stopped
 
     devices:
