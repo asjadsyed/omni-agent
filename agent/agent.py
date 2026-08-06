@@ -802,9 +802,8 @@ async def chat_with_agent(user_message_content) -> AsyncGenerator[dict, None]:
     while True:
         await trim_context()
 
-        model = f"{MODEL_ID}:free" if provider == Provider.OPENROUTER else MODEL_ID
         payload = {
-            "model": model,
+            "model": MODEL_ID,
             "messages": [
                 {k: v for k, v in msg.items() if not k.startswith("_")}
                 for msg in messages
