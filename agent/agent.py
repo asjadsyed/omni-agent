@@ -236,6 +236,7 @@ def count_tokens(messages, verbose=True):
         add_generation_prompt=True,
         tokenize=True,
         return_dict=True,
+        tools=TOOL_SCHEMAS,
     )
     token_count = len(encoded["input_ids"])
     if verbose:
